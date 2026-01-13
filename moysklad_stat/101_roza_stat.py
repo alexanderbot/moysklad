@@ -2,10 +2,8 @@ import os
 import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 from collections import defaultdict
-import asyncio
-import sqlite3
 from contextlib import contextmanager
 import hashlib
 import json
@@ -43,6 +41,128 @@ HEADERS = {
     PERIOD_END_DATE
 ) = range(2)
 
+# ============================================================
+# МЕНЕДЖЕР ДЛЯ ХРАНЕНИЯ ТОКЕНОВ В JSON ФАЙЛЕ
+# ============================================================
+
+USER_TOKENS_FILE = 'user_tokens.json'
+
+
+def load_user_tokens() -> Dict:
+    """Загрузка токенов из JSON файла"""
+    if os.path.exists(USER_TOKENS_FILE):
+        try:
+            with open(USER_TOKENS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Ошибка загрузки токенов: {e}")
+            return {}
+    return {}
+
+
+def save_user_tokens(tokens: Dict):
+    """Сохранение токенов в JSON файл"""
+    try:
+        with open(USER_TOKENS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(tokens, f, ensure_ascii=False, indent=2, default=str)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения токенов: {e}")
+
+
+def get_user_token(user_id: int) -> Optional[str]:
+    """Получение токена пользователя"""
+    tokens = load_user_tokens()
+    user_data = tokens.get(str(user_id), {})
+    return user_data.get('moysklad_token')
+
+
+def get_user_info(user_id: int) -> Optional[Dict]:
+    """Получение информации о пользователе"""
+    tokens = load_user_tokens()
+    user_data = tokens.get(str(user_id), {})
+    return user_data
+
+
+def set_user_token(user_id: int, token: str, **kwargs):
+    """Установка токена пользователя"""
+    tokens = load_user_tokens()
+    user_id_str = str(user_id)
+
+    if user_id_str not in tokens:
+        tokens[user_id_str] = {}
+
+    # Обновляем токен
+    tokens[user_id_str]['moysklad_token'] = token
+
+    # Обновляем дополнительные данные
+    for key, value in kwargs.items():
+        if value:  # Сохраняем только не пустые значения
+            tokens[user_id_str][key] = value
+
+    # Добавляем метаданные
+    tokens[user_id_str]['updated_at'] = datetime.now().isoformat()
+
+    save_user_tokens(tokens)
+
+
+def delete_user_token(user_id: int):
+    """Удаление токена пользователя"""
+    tokens = load_user_tokens()
+    user_id_str = str(user_id)
+
+    if user_id_str in tokens:
+        # Удаляем только токен, сохраняя другую информацию
+        if 'moysklad_token' in tokens[user_id_str]:
+            del tokens[user_id_str]['moysklad_token']
+
+        # Очищаем организацию, если она была
+        for key in ['organization_name', 'organization_inn', 'organization_email']:
+            if key in tokens[user_id_str]:
+                del tokens[user_id_str][key]
+
+        save_user_tokens(tokens)
+
+
+def update_user_activity(user_id: int, username: str = None, first_name: str = None, last_name: str = None):
+    """Обновление активности пользователя"""
+    tokens = load_user_tokens()
+    user_id_str = str(user_id)
+
+    if user_id_str not in tokens:
+        tokens[user_id_str] = {}
+
+    # Обновляем информацию о пользователе
+    if username:
+        tokens[user_id_str]['username'] = username
+    if first_name:
+        tokens[user_id_str]['first_name'] = first_name
+    if last_name:
+        tokens[user_id_str]['last_name'] = last_name
+
+    # Обновляем время последней активности
+    tokens[user_id_str]['last_activity'] = datetime.now().isoformat()
+
+    save_user_tokens(tokens)
+
+
+def get_all_users_with_tokens() -> List[Dict]:
+    """Получение всех пользователей с токенами"""
+    tokens = load_user_tokens()
+    users_with_tokens = []
+
+    for user_id_str, user_data in tokens.items():
+        if 'moysklad_token' in user_data:
+            users_with_tokens.append({
+                'user_id': user_id_str,
+                'username': user_data.get('username'),
+                'first_name': user_data.get('first_name'),
+                'last_name': user_data.get('last_name'),
+                'organization_name': user_data.get('organization_name'),
+                'last_activity': user_data.get('last_activity')
+            })
+
+    return users_with_tokens
+
 
 # ============================================================
 # УНИВЕРСАЛЬНЫЙ КЛИЕНТ МОЙСКЛАД (РАБОЧАЯ ВЕРСИЯ)
@@ -50,10 +170,59 @@ HEADERS = {
 
 
 class DebugMoySkladClient:
-    def __init__(self):
+    def __init__(self, user_id: int = None):
         self.base_url = MOYSKLAD_BASE_URL
-        self.headers = HEADERS
-        self.timeout = 60
+        self.user_id = user_id
+
+        # Получаем токен пользователя или используем глобальный
+        user_token = get_user_token(user_id) if user_id else None
+        self.token = user_token or MOYSKLAD_TOKEN
+
+        self.headers = {
+            'Authorization': f'Bearer {self.token}',
+            'Accept-Encoding': 'gzip'
+        }
+        self.timeout = 30
+
+    def is_token_valid(self) -> Tuple[bool, str]:
+        """Проверяет валидность токена"""
+        try:
+            response = requests.get(
+                f"{self.base_url}/entity/company",
+                headers=self.headers,
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                org_name = data.get('name', 'Неизвестно')
+                return True, org_name
+            else:
+                return False, f"Ошибка {response.status_code}"
+
+        except Exception as e:
+            return False, f"Ошибка: {str(e)}"
+
+    def get_organization_info(self) -> Dict:
+        """Получает информацию об организации"""
+        try:
+            response = requests.get(
+                f"{self.base_url}/entity/company",
+                headers=self.headers,
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                return {
+                    'name': data.get('name', 'Неизвестно'),
+                    'inn': data.get('inn', 'Не указан'),
+                    'email': data.get('email', 'Не указан'),
+                    'phone': data.get('phone', 'Не указан')
+                }
+        except Exception:
+            pass
+        return {}
 
     def get_debug_sales_data(self, start_date: str, end_date: str) -> Tuple[int, Decimal, List[dict]]:
         """Просто передаем данные как есть, без обработки"""
