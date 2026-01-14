@@ -60,8 +60,15 @@ def load_user_tokens() -> Dict:
 def save_user_tokens(tokens: Dict):
     """Сохранение токенов в JSON файл"""
     try:
+        # Преобразуем все datetime объекты в строки перед сохранением
+        def json_serializer(obj):
+            if isinstance(obj, datetime):
+                return obj.isoformat()
+            raise TypeError(f"Type {type(obj)} not serializable")
+
         with open(USER_TOKENS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(tokens, f, ensure_ascii=False, indent=2, default=str)
+            json.dump(tokens, f, ensure_ascii=False, indent=2, default=json_serializer)
+        logger.info(f"Токены успешно сохранены в {USER_TOKENS_FILE}")
     except Exception as e:
         logger.error(f"Ошибка сохранения токенов: {e}")
 
@@ -90,6 +97,7 @@ def set_user_token(user_id: int, token: str, **kwargs):
 
     # Обновляем токен
     tokens[user_id_str]['moysklad_token'] = token
+    tokens[user_id_str]['token_type'] = 'JWT' if '.' in token else 'Classic'
 
     # Обновляем дополнительные данные
     for key, value in kwargs.items():
@@ -156,37 +164,82 @@ class SimpleMoySkladClient:
         self.timeout = 30
 
     def is_token_valid(self) -> Tuple[bool, str]:
-        """Проверяет валидность токена"""
+        """Проверяет валидность токена (поддерживает оба формата)"""
         try:
-            # Используем правильные заголовки
+            if not self.token:
+                return False, "❌ Токен отсутствует"
+
+            # Определяем тип токена
+            is_jwt = '.' in self.token
+
+            logger.info(f"Проверка {self.user_id}: {'JWT' if is_jwt else 'Classic'} токен, длина: {len(self.token)}")
+
             headers = {
                 'Authorization': f'Bearer {self.token}',
-                'Accept-Encoding': 'gzip',
-                'Content-Type': 'application/json'
+                'Accept-Encoding': 'gzip'
             }
 
+            # РАЗНЫЕ ENDPOINTS ДЛЯ РАЗНЫХ ТОКЕНОВ
+            if is_jwt:
+                # JWT токен - новый API
+                url = f"{self.base_url}/entity/company"
+            else:
+                # Classic токен - старый API v1.1
+                url = "https://online.moysklad.ru/api/remap/1.1/entity/company"
+
+            logger.info(f"Используем URL: {url}")
+
             response = requests.get(
-                f"{self.base_url}/entity/company",
+                url,
                 headers=headers,
                 timeout=15
             )
 
-            logger.info(f"Проверка токена: статус {response.status_code}")
+            logger.info(f"Статус проверки токена {self.user_id}: {response.status_code}")
+
+            # Подробное логирование для отладки
+            if response.status_code != 200:
+                logger.error(f"Ответ API: {response.text[:200]}")
 
             if response.status_code == 200:
-                data = response.json()
-                org_name = data.get('name', 'Неизвестно')
-                return True, f"✅ Активен (организация: {org_name})"
+                try:
+                    data = response.json()
+                    org_name = data.get('name', 'Неизвестно')
+                    token_type = "JWT" if is_jwt else "Classic"
+                    return True, f"✅ {token_type} токен активен (организация: {org_name})"
+                except:
+                    token_type = "JWT" if is_jwt else "Classic"
+                    return True, f"✅ {token_type} токен активен"
+
             elif response.status_code == 401:
                 return False, "❌ Неавторизован (токен недействителен или устарел)"
             elif response.status_code == 403:
                 return False, "❌ Доступ запрещен (недостаточно прав)"
             elif response.status_code == 412:
-                return False, "❌ Неверный формат запроса (ошибка 412)"
+                # Для classic токена попробуем другой endpoint
+                if not is_jwt:
+                    logger.info("Пробуем endpoint /entity/counterparty для classic токена...")
+                    try:
+                        alt_response = requests.get(
+                            "https://online.moysklad.ru/api/remap/1.1/entity/counterparty",
+                            headers=headers,
+                            timeout=10,
+                            params={'limit': 1}
+                        )
+                        if alt_response.status_code == 200:
+                            return True, "✅ Classic токен активен (доступ к контрагентам)"
+                    except Exception as alt_e:
+                        logger.error(f"Альтернативная проверка тоже не удалась: {alt_e}")
+
+                return False, "❌ Неизвестный тип сущности (используйте новый JWT токен)"
             else:
                 try:
                     error_data = response.json()
-                    error_msg = error_data.get('errors', [{}])[0].get('error', f"Ошибка {response.status_code}")
+                    errors = error_data.get('errors', [{}])
+                    if errors:
+                        error_msg = errors[0].get('error', f"Ошибка {response.status_code}")
+                    else:
+                        error_msg = f"Ошибка {response.status_code}"
                     return False, f"❌ {error_msg}"
                 except:
                     return False, f"❌ Ошибка API: {response.status_code}"
@@ -196,14 +249,23 @@ class SimpleMoySkladClient:
         except requests.exceptions.ConnectionError:
             return False, "❌ Ошибка соединения"
         except Exception as e:
-            logger.error(f"Ошибка при проверке токена: {e}")
-            return False, f"❌ Ошибка: {str(e)[:100]}"
+            logger.error(f"Ошибка при проверке токена {self.user_id}: {e}")
+            return False, f"❌ Ошибка: {str(e)[:50]}"
 
     def get_organization_info(self) -> Dict:
-        """Получает информацию об организации"""
+        """Получает информацию об организации (поддерживает оба типа токенов)"""
         try:
+            is_jwt = '.' in self.token if self.token else False
+
+            if is_jwt:
+                # JWT токен - новый API
+                url = f"{self.base_url}/entity/company"
+            else:
+                # Classic токен - старый API
+                url = "https://online.moysklad.ru/api/remap/1.1/entity/company"
+
             response = requests.get(
-                f"{self.base_url}/entity/company",
+                url,
                 headers=self.headers,
                 timeout=10
             )
@@ -218,8 +280,18 @@ class SimpleMoySkladClient:
                     'actual_address': data.get('actualAddress', 'Не указан'),
                     'legal_address': data.get('legalAddress', 'Не указан')
                 }
+            elif not is_jwt and response.status_code == 412:
+                # Для classic токена возвращаем базовую информацию
+                return {
+                    'name': 'Организация (Classic токен)',
+                    'inn': 'Определяется через другие endpoints',
+                    'email': 'Не указан для classic токена',
+                    'phone': 'Не указан'
+                }
         except Exception as e:
             logger.error(f"Ошибка получения информации об организации: {e}")
+
+        # Возвращаем пустой словарь в случае ошибки
         return {}
 
     def get_customer_orders_data(self, start_date: str, end_date: str) -> Tuple[int, Decimal, List[dict]]:
@@ -1442,7 +1514,7 @@ async def set_token_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка ввода токена"""
+    """Обработка ввода токена (поддерживает оба формата)"""
     try:
         user = update.effective_user
 
@@ -1466,7 +1538,7 @@ async def handle_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return TOKEN_INPUT
 
-        # ОЧИЩАЕМ токен максимально агрессивно
+        # ОЧИЩАЕМ токен
         import re
         original_token = token
 
@@ -1475,60 +1547,51 @@ async def handle_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         # 2. Удаляем форматирование Markdown
         token = token.replace('`', '').replace('*', '').replace('_', '').replace('~', '')
-        token = token.replace('\\', '').replace('/', '')
+        token = token.replace('\\', '').replace('/', '').replace('"', '').replace("'", "")
 
-        # 3. Проверяем базовую структуру
-        if '.' not in token:
-            logger.error(f"Токен не содержит точек, возможно поврежден: {token[:50]}...")
-            await update.message.reply_text(
-                "❌ *Неверный формат токена!*\n\n"
-                "Токен должен содержать точки (формат JWT).\n"
-                "Возможно, токен поврежден при копировании.\n\n"
-                "Создайте новый токен и попробуйте снова.\n"
-                "Или /cancel для отмены",
-                parse_mode='Markdown'
-            )
-            return TOKEN_INPUT
+        # 3. Определяем тип токена
+        is_jwt = '.' in token  # JWT содержит точки
+        token_type = "JWT" if is_jwt else "Classic"
 
-        if len(token) < 50:
+        # Проверяем минимальную длину
+        if len(token) < 10:
             logger.error(f"Токен слишком короткий: {len(token)} символов")
             await update.message.reply_text(
                 f"❌ *Токен слишком короткий!*\n\n"
                 f"Длина после очистки: {len(token)} символов\n"
-                f"Ожидается: 100+ символов\n\n"
+                f"Минимальная длина: 10 символов\n\n"
                 f"Проверьте, что скопировали весь токен.\n"
                 f"Или /cancel для отмены",
                 parse_mode='Markdown'
             )
             return TOKEN_INPUT
 
-        # 4. Проверяем структуру JWT
-        token_parts = token.split('.')
-        if len(token_parts) != 3:
-            logger.error(f"Токен не в формате JWT: {len(token_parts)} частей")
-            await update.message.reply_text(
-                f"❌ *Неверный формат JWT!*\n\n"
-                f"Токен должен состоять из 3 частей.\n"
-                f"Найдено: {len(token_parts)} частей\n\n"
-                f"Создайте новый токен и попробуйте снова.\n"
-                f"Или /cancel для отмены",
-                parse_mode='Markdown'
-            )
-            return TOKEN_INPUT
-
-        # Логируем информацию о токене
-        logger.info(f"Токен после очистки: {len(token)} символов")
-        logger.info(f"Части JWT: {len(token_parts)}")
-        logger.info(f"Длины частей: {[len(p) for p in token_parts]}")
+        # 4. Для JWT-токена проверяем структуру
+        if is_jwt:
+            token_parts = token.split('.')
+            if len(token_parts) != 3:
+                logger.error(f"Токен не в формате JWT: {len(token_parts)} частей")
+                await update.message.reply_text(
+                    f"❌ *Неверный формат JWT!*\n\n"
+                    f"Токен должен состоять из 3 частей.\n"
+                    f"Найдено: {len(token_parts)} частей\n\n"
+                    f"Создайте новый токен и попробуйте снова.\n"
+                    f"Или /cancel для отмены",
+                    parse_mode='Markdown'
+                )
+                return TOKEN_INPUT
+            logger.info(f"Токен JWT: {len(token_parts)} части, длины: {[len(p) for p in token_parts]}")
+        else:
+            logger.info(f"Токен Classic: {len(token)} символов")
 
         checking_msg = await update.message.reply_text(
-            "⏳ *Проверяю токен...*\n\n"
-            "Это может занять несколько секунд.",
+            f"⏳ *Проверяю токен...*\n\n"
+            "API v1.1 отключен, но попробуем проверить через v1.2...",
             parse_mode='Markdown'
         )
 
         # ============================================================
-        # ПРОСТАЯ проверка токена - минимальный запрос
+        # ПРОВЕРКА ЧЕРЕЗ API v1.2 (последняя попытка)
         # ============================================================
         headers = {
             'Authorization': f'Bearer {token}',
@@ -1536,127 +1599,108 @@ async def handle_token_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         }
 
         try:
-            # Делаем ПРОСТОЙ запрос для проверки
-            logger.info(f"Отправляю запрос к API МойСклад...")
+            logger.info(f"Пробуем API v1.2 с classic токеном...")
             response = requests.get(
                 f"{MOYSKLAD_BASE_URL}/entity/company",
                 headers=headers,
                 timeout=20
             )
 
-            logger.info(f"Ответ получен: статус {response.status_code}")
+            logger.info(f"Ответ API v1.2: {response.status_code}")
 
             if response.status_code == 200:
+                # Если заработало через v1.2
                 data = response.json()
                 org_name = data.get('name', 'Неизвестно')
 
-                logger.info(f"✅ ТОКЕН РАБОТАЕТ! Организация: {org_name}")
-
-                # Сохраняем токен
-                set_user_token(user.id, token)
-
+                # Сохраняем и завершаем
+                set_user_token(user.id, token, organization_name=org_name, token_type="Classic (v1.2)")
                 await checking_msg.delete()
+                await update.message.reply_text(f"✅ Токен работает через API v1.2! Организация: {org_name}")
+                return ConversationHandler.END
 
-                success_msg = f"""
-✅ *Токен успешно установлен и проверен!*
-
-🏢 Организация: *{org_name}*
-👤 Пользователь: *{user.first_name or user.username}*
-
-Теперь вы можете использовать все функции бота.
-"""
-
-                keyboard = [
-                    [InlineKeyboardButton("📊 Статистика за сегодня", callback_data='today')],
-                    [InlineKeyboardButton("✅ Проверить токен", callback_data='check_token')],
-                    [InlineKeyboardButton("🔙 Главное меню", callback_data='main_menu')]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-
-                await update.message.reply_text(success_msg, reply_markup=reply_markup, parse_mode='Markdown')
+            elif response.status_code in [410, 412]:
+                # API v1.1 не работает, предлагаем пропустить проверку
+                await checking_msg.edit_text(
+                    f"⚠️ *Не удалось проверить через API*\n\n"
+                    f"Статус: {response.status_code}\n"
+                    f"Тип токена: Classic\n\n"
+                    f"*Хотите сохранить токен без проверки?*\n"
+                    f"Может работать для некоторых запросов.",
+                    parse_mode='Markdown',
+                    reply_markup=InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("✅ Да, сохранить", callback_data=f"save_token_{token}"),
+                            InlineKeyboardButton("❌ Нет, отмена", callback_data="cancel_token")
+                        ]
+                    ])
+                )
                 return ConversationHandler.END
 
             else:
-                # Подробная диагностика ошибки
-                try:
-                    error_data = response.json()
-                    errors = error_data.get('errors', [])
-                    if errors:
-                        error_msg = errors[0].get('error', f"Ошибка {response.status_code}")
-                    else:
-                        error_msg = f"Ошибка {response.status_code}"
-                except:
-                    error_msg = f"Ошибка {response.status_code}"
-
-                logger.error(f"Токен не прошел проверку: {error_msg}")
-
-                # Диагностическая информация
-                diagnostic = f"""
-📊 *Диагностика:*
-
-• Статус ответа: {response.status_code}
-• Ошибка: {error_msg}
-• Длина токена: {len(token)} символов
-• Формат JWT: {'✅' if len(token_parts) == 3 else '❌'}
-"""
-
+                # Другие ошибки
                 await checking_msg.edit_text(
-                    f"❌ *Токен не прошел проверку!*\n\n"
-                    f"{diagnostic}\n\n"
-                    f"*Что сделать:*\n"
-                    f"1. Убедитесь, что токен активен\n"
-                    f"2. Проверьте права токена (нужны на чтение)\n"
-                    f"3. Создайте новый токен\n"
-                    f"4. Попробуйте снова\n\n"
-                    f"Или /cancel для отмены",
+                    f"❌ Ошибка {response.status_code}\n\n"
+                    f"Попробуйте создать новый JWT токен.",
                     parse_mode='Markdown'
                 )
                 return TOKEN_INPUT
 
-        except requests.exceptions.Timeout:
-            logger.error("Таймаут при проверке токена")
-            await checking_msg.edit_text(
-                "❌ *Таймаут запроса!*\n\n"
-                "Сервер МойСклад не ответил.\n"
-                "Попробуйте позже или /cancel",
-                parse_mode='Markdown'
-            )
-            return TOKEN_INPUT
-
-        except requests.exceptions.ConnectionError:
-            logger.error("Ошибка соединения при проверке токена")
-            await checking_msg.edit_text(
-                "❌ *Ошибка соединения!*\n\n"
-                "Не удалось подключиться к серверу.\n"
-                "Проверьте интернет-соединение.\n"
-                "Попробуйте позже или /cancel",
-                parse_mode='Markdown'
-            )
-            return TOKEN_INPUT
-
         except Exception as e:
-            logger.error(f"Ошибка при проверке токена: {e}", exc_info=True)
+            logger.error(f"Ошибка проверки: {e}")
             await checking_msg.edit_text(
-                f"❌ *Ошибка проверки!*\n\n"
-                f"Ошибка: {str(e)[:100]}\n\n"
-                f"Попробуйте снова или /cancel",
-                parse_mode='Markdown'
+                f"⚠️ Ошибка соединения\n\n"
+                f"Сохранить токен без проверки?",
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Да, сохранить", callback_data=f"save_token_{token}"),
+                        InlineKeyboardButton("❌ Нет, отмена", callback_data="cancel_token")
+                    ]
+                ])
             )
-            return TOKEN_INPUT
+            return ConversationHandler.END
 
     except Exception as e:
-        logger.error(f"Критическая ошибка в handle_token_input: {e}", exc_info=True)
-        try:
-            await update.message.reply_text(
-                f"❌ *Внутренняя ошибка бота!*\n\n"
-                f"Пожалуйста, сообщите администратору.\n"
-                f"Ошибка: {str(e)[:100]}",
-                parse_mode='Markdown'
-            )
-        except:
-            pass
+        logger.error(f"Ошибка в handle_token_input: {e}")
+        await update.message.reply_text("❌ Ошибка обработки")
         return ConversationHandler.END
 
+
+async def save_token_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка сохранения токена без проверки"""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+
+    if query.data.startswith("save_token_"):
+        token = query.data.replace("save_token_", "")
+
+        # Сохраняем токен без проверки
+        set_user_token(
+            user.id,
+            token,
+            organization_name="Не проверено (Classic токен)",
+            token_type="Classic (без проверки)",
+            api_warning="API v1.1 отключен, токен сохранен без проверки"
+        )
+
+        await query.edit_message_text(
+            f"✅ *Токен сохранен без проверки*\n\n"
+            f"Длина: {len(token)} символов\n"
+            f"Тип: Classic токен\n\n"
+            f"⚠️ *Предупреждение:*\n"
+            f"API v1.1 отключен, некоторые функции могут не работать.\n\n"
+            f"Попробуйте команду /statistics для теста.",
+            parse_mode='Markdown'
+        )
+
+        # Обновляем активность
+        update_user_activity(user.id, user.username, user.first_name, user.last_name)
+
+    elif query.data == "cancel_token":
+        await query.edit_message_text("❌ *Отменено*\n\nТокен не сохранен.", parse_mode='Markdown')
 
 async def check_token_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Проверка токена"""
@@ -2279,14 +2323,12 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 def main():
-    """Основная функция"""
+    # Проверка загрузки критических переменных
     if not TELEGRAM_BOT_TOKEN:
-        logger.error("❌ Не установлен TELEGRAM_BOT_TOKEN в .env файле")
+        logger.error("Не найден TELEGRAM_BOT_TOKEN в переменных окружения!")
         return
-
     if not MOYSKLAD_TOKEN:
-        logger.warning("⚠️ Не установлен MOYSKLAD_TOKEN в .env файле")
-        logger.info("Бот будет работать только с токенами пользователей")
+        logger.warning("MOYSKLAD_TOKEN не задан. Будет работать только с пользовательскими токенами.")
 
     try:
         logger.info("=" * 50)
@@ -2383,6 +2425,7 @@ def main():
         application.add_handler(CommandHandler("month", month_command))
         application.add_handler(CommandHandler("top", top_command))
         application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(CallbackQueryHandler(save_token_callback, pattern="^(save_token_|cancel_token)"))
 
         # 3. Обработчик кнопок
         application.add_handler(CallbackQueryHandler(button_handler))
